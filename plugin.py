@@ -1,9 +1,8 @@
 """HS Pocket Director — mobile-first MiniMax H3 directing UI for Wan2GP.
 
-This first scaffold intentionally contains no H3 generation logic. It only hosts
-an isolated browser UI inside a Wan2GP tab. Future Wan2GP integration should be
-added behind a small request/response bridge rather than coupled directly to
-frontend components.
+The browser UI is intentionally isolated from Wan2GP internals. Generation,
+project files, media uploads and model discovery will be added behind a small
+request/response bridge rather than coupled directly to frontend components.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ from shared.utils.plugins import WAN2GPPlugin
 
 PLUGIN_ID = "hs_pocket_director"
 PLUGIN_NAME = "HS Pocket Director"
-PLUGIN_VERSION = "0.1.0-alpha.1"
+PLUGIN_VERSION = "0.1.0-alpha.2"
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = PLUGIN_DIR / "assets"
@@ -45,7 +44,7 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
 
         Keeping the positional api_session argument is intentional. Wan2GP uses
         it to create the plugin API session and wrap callbacks correctly. The
-        initial static shell does not call the session yet.
+        current UI is still browser-local; backend calls are the next phase.
         """
         del api_session
 
