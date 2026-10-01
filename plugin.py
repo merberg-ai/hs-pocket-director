@@ -1,8 +1,7 @@
 """HS Pocket Director — mobile-first MiniMax H3 directing UI for Wan2GP.
 
-The browser UI stays isolated from Wan2GP internals. This module owns the small
-request/response bridge, durable media storage, and H3 capability discovery.
-Generation itself remains behind the next bridge phase.
+This module owns the browser bridge, persistent media library, and defensive
+H3 capability discovery used by the mobile frontend.
 """
 
 from __future__ import annotations
@@ -25,7 +24,8 @@ from shared.utils.plugins import WAN2GPPlugin
 
 PLUGIN_ID = "hs_pocket_director"
 PLUGIN_NAME = "HS Pocket Director"
-PLUGIN_VERSION = "0.1.0-alpha.4"
+PLUGIN_VERSION = "0.1.0-alpha.4.1"
+ASSET_REVISION = "alpha4-bridge-state-fix-1"
 LOG_PREFIX = "[HS-Pocket]"
 
 PLUGIN_DIR = Path(__file__).resolve().parent
@@ -61,9 +61,8 @@ H3_GRID_FALLBACK = {
 }
 
 RESOLUTION_FALLBACK = [
-    "480x832", "832x480",
-    "704x1280", "720x1280", "1280x720", "1024x1024",
-    "1088x1920", "1920x1088",
+    "480x832", "832x480", "704x1280", "720x1280", "1280x720",
+    "1024x1024", "1088x1920", "1920x1088",
 ]
 
 FALLBACK_MODELS = [
@@ -139,18 +138,14 @@ def _deep_value(obj, keys):
 
 def _as_int(value, default=None):
     try:
-        if value is None:
-            return default
-        return int(round(float(value)))
+        return int(round(float(value))) if value is not None else default
     except Exception:
         return default
 
 
 def _as_float(value, default=None):
     try:
-        if value is None:
-            return default
-        return float(value)
+        return float(value) if value is not None else default
     except Exception:
         return default
 
@@ -192,64 +187,45 @@ def _snap_grid(value, offset, step, minimum, maximum):
     return max(minimum, min(maximum, snapped))
 
 
-# Runs in the Wan2GP parent page. The mobile UI lives inside an iframe. One
-# hidden request/response pair is deliberately serialized: it is boring, but
-# very reliable across Gradio versions and plenty fast for UI/config traffic.
 _BRIDGE_JS = r"""
 (function () {
   if (window.__HSPD_BRIDGE__) return;
   window.__HSPD_BRIDGE__ = true;
-
-  const FRAME_TAG = "hspd_frame";
-  const PARENT_TAG = "hspd_parent";
+  const FRAME_TAG = "hspd_frame", PARENT_TAG = "hspd_parent";
   const state = { queue: [], busy: false, timer: null, lastResp: "" };
-
   function roots() {
     const out = [document];
-    try {
-      const app = document.querySelector("gradio-app");
-      if (app && app.shadowRoot) out.push(app.shadowRoot);
-    } catch (_) {}
+    try { const app = document.querySelector("gradio-app"); if (app && app.shadowRoot) out.push(app.shadowRoot); } catch (_) {}
     return out;
   }
   function query(selector) {
-    for (const root of roots()) {
-      try { const found = root.querySelector(selector); if (found) return found; } catch (_) {}
-    }
+    for (const root of roots()) { try { const found = root.querySelector(selector); if (found) return found; } catch (_) {} }
     return null;
   }
   function host(id) { return query("#" + id); }
   function input(id) {
-    const h = host(id);
-    if (!h) return null;
+    const h = host(id); if (!h) return null;
     if (h.matches && h.matches("textarea,input")) return h;
     return h.querySelector("textarea,input[type='text'],input:not([type='hidden'])");
   }
   function setValue(id, value) {
-    const el = input(id);
-    if (!el) return false;
+    const el = input(id); if (!el) return false;
     try {
       const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
-      setter.call(el, value);
+      Object.getOwnPropertyDescriptor(proto, "value").set.call(el, value);
       el.dispatchEvent(new Event("input", { bubbles: true }));
       el.dispatchEvent(new Event("change", { bubbles: true }));
       return true;
     } catch (err) { console.error("[HS-Pocket] could not set", id, err); return false; }
   }
   function click(id) {
-    const h = host(id);
-    if (!h) return false;
+    const h = host(id); if (!h) return false;
     const button = h.matches && h.matches("button") ? h : h.querySelector("button");
-    if (!button) return false;
-    button.click(); return true;
-  }
-  function frameWindow() {
-    const frame = query("#hspd-frame");
-    return frame && frame.contentWindow ? frame.contentWindow : null;
+    if (!button) return false; button.click(); return true;
   }
   function toFrame(msg) {
-    const target = frameWindow();
+    const frame = query("#hspd-frame");
+    const target = frame && frame.contentWindow ? frame.contentWindow : null;
     if (!target) return;
     try { target.postMessage(Object.assign({ source: PARENT_TAG }, msg), "*"); } catch (_) {}
   }
@@ -275,21 +251,17 @@ _BRIDGE_JS = r"""
     state.queue.push(message); pump();
   });
   setInterval(function () {
-    const el = input("hspd-resp");
-    const value = el ? String(el.value || "") : "";
+    const el = input("hspd-resp"), value = el ? String(el.value || "") : "";
     if (!value || value === state.lastResp) return;
     state.lastResp = value;
     try { toFrame(JSON.parse(value)); } catch (err) { toFrame({ error: "Bad bridge response: " + String(err) }); }
     release();
   }, 100);
-  console.log("[HS-Pocket] parent bridge installed");
 })();
 """
 
 
 class HSPocketDirectorPlugin(WAN2GPPlugin):
-    """Wan2GP application plugin hosting the Pocket Director mobile UI."""
-
     def __init__(self):
         super().__init__()
         self.name = PLUGIN_NAME
@@ -300,34 +272,26 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
         self._library = self._load_library()
 
     def setup_ui(self):
-        # These are all used by current H3 Director builds. request_global is
-        # intentionally best-effort so Pocket Director can still boot on an
-        # older/newer Wan2GP build and fall back gracefully.
         for name in (
-            "get_model_def",
-            "get_model_defs",
-            "get_model_name",
-            "get_base_model_type",
-            "get_current_model_settings",
+            "get_model_def", "get_model_defs", "get_model_name",
+            "get_base_model_type", "get_current_model_settings",
         ):
             try:
                 self.request_global(name)
             except Exception as exc:
                 trace(f"optional global {name} unavailable: {exc}")
-
         self.add_custom_js(_BRIDGE_JS)
         self.add_tab(tab_id=PLUGIN_ID, label=PLUGIN_NAME, component_constructor=self._build_ui)
         trace(f"registered {PLUGIN_NAME} {PLUGIN_VERSION}")
 
     def _build_ui(self, api_session):
-        # Keeping this positional argument is important. Wan2GP builds the
-        # per-plugin API session when the tab constructor accepts it.
+        # The positional argument causes Wan2GP to create the per-plugin WebUI
+        # API session. The bridge callback below must ALSO mention
+        # self._wangp_session literally so Wan2GP wraps it with live Gradio state.
         del api_session
         host_css = (
-            "<style>"
-            "#hspd-host,#hspd-host>div{padding:0!important;margin:0!important;}"
-            "#hspd-host iframe{display:block;}"
-            "</style>"
+            "<style>#hspd-host,#hspd-host>div{padding:0!important;margin:0!important;}"
+            "#hspd-host iframe{display:block;}</style>"
         )
         with gr.Column(elem_id="hspd-plugin"):
             gr.HTML(value=host_css + self._iframe_html(), elem_id="hspd-host", min_height=None)
@@ -339,10 +303,12 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
             except TypeError:
                 go.click(fn=self._on_bridge, inputs=[req], outputs=[resp], show_progress="hidden")
 
-    # ------------------------------------------------------------------
-    # Request/response bridge
-    # ------------------------------------------------------------------
     def _on_bridge(self, raw):
+        # IMPORTANT: do not replace this with getattr(). Wan2GP inspects the
+        # callback's code object for the literal _wangp_session name. That is
+        # how it knows this handler needs the live Gradio state wrapper.
+        session = self._wangp_session if hasattr(self, "_wangp_session") else None
+        _ = session
         try:
             message = json.loads(raw or "{}")
             cmd = str(message.get("cmd") or "")
@@ -356,8 +322,7 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
                 message_id = message.get("id")
                 cmd = str(message.get("cmd") or "error")
             except Exception:
-                message_id = None
-                cmd = "error"
+                message_id, cmd = None, "error"
             return json.dumps({"cmd": cmd + ":error", "id": message_id, "error": str(exc)})
 
     def _dispatch(self, cmd: str, data: dict):
@@ -377,12 +342,7 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
             return self._validate_plan(data)
         raise ValueError(f"unknown bridge command: {cmd}")
 
-    # ------------------------------------------------------------------
-    # H3 capability discovery
-    # ------------------------------------------------------------------
     def _session(self):
-        # Literal dotted access is intentional. Wan2GP's callback wrapper
-        # recognises this name and provides/pumps the plugin API session.
         return self._wangp_session if hasattr(self, "_wangp_session") else None
 
     def _call_optional(self, name, *args):
@@ -399,10 +359,11 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
         out = []
         if isinstance(defs, dict):
             for container_key in ("models", "model_defs", "definitions"):
-                if container_key in defs and isinstance(defs[container_key], (dict, list, tuple)):
-                    nested = HSPocketDirectorPlugin._normalize_model_defs(defs[container_key])
-                    if nested:
-                        return nested
+                nested = defs.get(container_key)
+                if isinstance(nested, (dict, list, tuple)):
+                    normalized = HSPocketDirectorPlugin._normalize_model_defs(nested)
+                    if normalized:
+                        return normalized
             for key, value in defs.items():
                 if isinstance(value, dict):
                     out.append((str(key), value))
@@ -443,7 +404,6 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
         injected = getattr(self, "get_model_defs", None)
         if callable(injected):
             attempts.append(("global get_model_defs", lambda: injected()))
-
         for label, fn in attempts:
             try:
                 normalized = self._normalize_model_defs(fn())
@@ -527,14 +487,10 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
             value = _as_int(_deep_value(model_def, keys))
             if value is not None:
                 grid[target] = value
-
-        # Wan2GP H3 definitions commonly expose frames_minimum without a
-        # separate window minimum. Match Director's behaviour in that case.
         if _deep_value(model_def, aliases["windowMin"]) is None:
             frames_min = _as_int(_deep_value(model_def, aliases["framesMinimum"]))
             if frames_min is not None:
                 grid["windowMin"] = frames_min
-
         grid["frameStep"] = max(1, grid["frameStep"])
         grid["overlapStep"] = max(1, grid["overlapStep"])
         grid["windowMax"] = max(grid["windowMin"], grid["windowMax"])
@@ -568,26 +524,23 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
         value = self._call_optional("get_current_model_settings")
         if not isinstance(value, dict):
             return {}
-        allow = {
+        allowed = {
             "model_type", "resolution", "video_resolution", "seed", "repeat_generation",
             "num_inference_steps", "steps", "flow_shift", "flowshift", "guidance_scale", "guidance",
             "sliding_window_size", "sliding_window_overlap", "sample_solver", "solver",
             "activated_loras", "lora_weights", "guidance_phases", "attention_sparsity",
             "skip_steps_cache_type", "skip_steps_multiplier", "skip_steps_start_step_perc",
         }
-        return {str(k): _json_safe(v) for k, v in value.items() if str(k) in allow}
+        return {str(k): _json_safe(v) for k, v in value.items() if str(k) in allowed}
 
     def _list_h3_models(self):
         current = self._current_model_name()
-        rows = []
-        seen = set()
+        rows, seen = [], set()
         for model_id, model_def in self._raw_model_defs():
-            if not model_id:
-                continue
-            if not self._is_h3(model_id, model_def):
+            if not model_id or not self._is_h3(model_id, model_def):
                 continue
             haystack = f"{model_id} {json.dumps(model_def, default=str)}"
-            item = {
+            rows.append({
                 "id": model_id,
                 "label": self._model_label(model_id, model_def),
                 "pipeline": self._infer_pipeline(haystack),
@@ -595,10 +548,8 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
                 "verified": True,
                 "resolutions": _collect_resolutions(model_def),
                 "grid": self._derive_grid(model_def),
-            }
-            rows.append(item)
+            })
             seen.add(model_id)
-
         if current and current not in seen and "h3" in current.lower():
             model_def = self._model_def_for(current)
             haystack = f"{current} {json.dumps(model_def, default=str)}"
@@ -611,10 +562,8 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
                 "resolutions": _collect_resolutions(model_def),
                 "grid": self._derive_grid(model_def),
             })
-
         if not rows:
             rows = [{**item, "resolutions": list(RESOLUTION_FALLBACK), "grid": dict(H3_GRID_FALLBACK)} for item in FALLBACK_MODELS]
-
         order = {"Hybrid": 0, "FL2VA": 1, "Ref2VA": 2, "H3": 3}
         rows.sort(key=lambda item: (order.get(item["pipeline"], 9), item["label"].lower()))
         return rows
@@ -633,7 +582,6 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
         current_model = self._current_model_name()
         base_model = self._current_base_model()
         settings = self._current_settings()
-
         selected = next((item for item in models if item["id"] == current_model), None) or models[0]
         grid = dict(selected.get("grid") or H3_GRID_FALLBACK)
         resolutions = []
@@ -644,7 +592,6 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
         if not resolutions:
             resolutions = list(RESOLUTION_FALLBACK)
         resolutions.sort(key=lambda item: (int(item.split("x")[0]) * int(item.split("x")[1]), item))
-
         current_resolution = str(self._pick_setting(settings, "resolution", "video_resolution", default="") or "").replace("×", "x")
         defaults = {
             "model": current_model if any(item["id"] == current_model for item in models) else selected["id"],
@@ -656,15 +603,14 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
             "windowSize": _as_int(self._pick_setting(settings, "sliding_window_size"), grid["windowDefault"]),
             "overlap": _as_int(self._pick_setting(settings, "sliding_window_overlap"), grid["overlapDefault"]),
         }
-
-        session = self._session()
         warnings = []
         if source == "fallback":
             warnings.append("Wan2GP did not return a live H3 model roster. Pocket Director is showing conservative H3 fallback values until discovery succeeds.")
         if not current_model:
             warnings.append("Wan2GP did not report a current model name.")
-
-        result = {
+        session = self._session()
+        trace(f"capabilities: source={source} H3_models={len(models)} current={current_model or '-'}")
+        return {
             "version": PLUGIN_VERSION,
             "source": source,
             "models": models,
@@ -672,20 +618,10 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
             "grid": grid,
             "defaults": defaults,
             "current": {"model": current_model, "baseModel": base_model, "settings": settings},
-            "referenceLimits": {
-                "images": grid["maxRefImages"],
-                "videos": grid["maxRefVideos"],
-                "audio": grid["maxRefAudio"],
-            },
-            "features": {
-                "sessionApi": session is not None,
-                "liveModelDefs": bool(live_models),
-                "currentSettings": bool(settings),
-            },
+            "referenceLimits": {"images": grid["maxRefImages"], "videos": grid["maxRefVideos"], "audio": grid["maxRefAudio"]},
+            "features": {"sessionApi": session is not None, "liveModelDefs": bool(live_models), "currentSettings": bool(settings)},
             "warnings": warnings,
         }
-        trace(f"capabilities: source={source} H3_models={len(models)} current={current_model or '-'}")
-        return result
 
     def _validate_plan(self, data):
         caps = self._capabilities()
@@ -694,7 +630,6 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
         model = next((item for item in models if item["id"] == model_id), None)
         if model is None:
             return {"ok": False, "errors": [f"Unknown H3 model: {model_id}"], "warnings": [], "summary": {}}
-
         grid = dict(model.get("grid") or caps["grid"] or H3_GRID_FALLBACK)
         fps = max(1, _as_int(data.get("fps"), grid.get("fps", 24)))
         duration = max(0.5, _as_float(data.get("durationSec"), 0.5))
@@ -702,7 +637,6 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
         scene_count = max(0, _as_int(data.get("sceneCount"), 0))
         resolution = str(data.get("resolution") or caps["defaults"]["resolution"]).replace("×", "x")
         allowed_resolutions = model.get("resolutions") or caps["resolutions"]
-
         requested_window = _as_int(data.get("windowSize"), grid["windowDefault"])
         requested_overlap = _as_int(data.get("overlap"), grid["overlapDefault"])
         window = _snap_grid(requested_window, grid["frameOffset"], grid["frameStep"], grid["windowMin"], grid["windowMax"])
@@ -710,11 +644,9 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
         if overlap >= window:
             overlap = max(grid["overlapMin"], window - grid["overlapStep"])
             overlap = _snap_grid(overlap, grid["overlapOffset"], grid["overlapStep"], grid["overlapMin"], min(grid["overlapMax"], window - 1))
-
         stride = max(1, window - overlap)
         windows = 1 if frames <= window else 1 + math.ceil((frames - window) / stride)
-        errors = []
-        warnings = []
+        errors, warnings = [], []
         if scene_count <= 0:
             errors.append("The project has no scenes.")
         if resolution not in allowed_resolutions:
@@ -727,31 +659,19 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
             warnings.append(f"The timeline is {frames} frames, below this model's advertised minimum generation size of {grid['framesMinimum']} frames.")
         if not model.get("verified"):
             warnings.append("This model entry came from Pocket Director's fallback roster rather than live Wan2GP discovery.")
-
         return {
             "ok": not errors,
             "errors": errors,
             "warnings": warnings,
             "summary": {
-                "model": model["id"],
-                "label": model["label"],
-                "pipeline": model["pipeline"],
-                "resolution": resolution,
-                "fps": fps,
-                "durationSec": round(duration, 3),
-                "targetFrames": frames,
-                "windowSize": window,
-                "overlap": overlap,
-                "windows": windows,
-                "steps": max(1, _as_int(data.get("steps"), 20)),
-                "seed": _as_int(data.get("seed"), -1),
+                "model": model["id"], "label": model["label"], "pipeline": model["pipeline"],
+                "resolution": resolution, "fps": fps, "durationSec": round(duration, 3),
+                "targetFrames": frames, "windowSize": window, "overlap": overlap, "windows": windows,
+                "steps": max(1, _as_int(data.get("steps"), 20)), "seed": _as_int(data.get("seed"), -1),
                 "referenceCount": max(0, _as_int(data.get("referenceCount"), 0)),
             },
         }
 
-    # ------------------------------------------------------------------
-    # Media library
-    # ------------------------------------------------------------------
     def _load_library(self) -> dict:
         if LIBRARY_JSON.exists():
             try:
@@ -770,12 +690,8 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
                     continue
                 media_id = path.stem
                 rebuilt[media_id] = {
-                    "mediaId": media_id,
-                    "name": path.name,
-                    "file": path.name,
-                    "kind": kind,
-                    "mime": mimetypes.guess_type(path.name)[0] or "",
-                    "size": path.stat().st_size,
+                    "mediaId": media_id, "name": path.name, "file": path.name, "kind": kind,
+                    "mime": mimetypes.guess_type(path.name)[0] or "", "size": path.stat().st_size,
                     "createdAt": path.stat().st_mtime,
                 }
         except Exception as exc:
@@ -842,8 +758,7 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
     def _adopt_media(self, data: dict):
         name = Path(str(data.get("name") or "upload.bin")).name
         mime = str(data.get("mime") or "")
-        ext = _safe_ext(name)
-        kind = _media_kind(name, mime)
+        ext, kind = _safe_ext(name), _media_kind(name, mime)
         if not ext or kind == "other":
             raise ValueError("unsupported media type")
         src = Path(str(data.get("path") or ""))
@@ -860,11 +775,9 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
         return self._store_media_from_path(src, name, mime, size, digest, kind, ext)
 
     def _upload_media(self, data: dict):
-        """Small-file fallback when the browser cannot reach Gradio's upload route."""
         name = Path(str(data.get("name") or "upload.bin")).name
         mime = str(data.get("mime") or "")
-        ext = _safe_ext(name)
-        kind = _media_kind(name, mime)
+        ext, kind = _safe_ext(name), _media_kind(name, mime)
         if not ext or kind == "other":
             raise ValueError("unsupported media type")
         encoded = str(data.get("b64") or "")
@@ -892,12 +805,8 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
     def _record_media(self, media_id: str, dest: Path, name: str, mime: str, size: int, kind: str, duplicate: bool):
         existing = self._library.get(media_id) or {}
         item = {
-            "mediaId": media_id,
-            "name": existing.get("name") or name,
-            "file": dest.name,
-            "kind": kind,
-            "mime": mime or mimetypes.guess_type(name)[0] or "",
-            "size": int(size),
+            "mediaId": media_id, "name": existing.get("name") or name, "file": dest.name, "kind": kind,
+            "mime": mime or mimetypes.guess_type(name)[0] or "", "size": int(size),
             "createdAt": existing.get("createdAt") or time.time(),
         }
         self._library[media_id] = item
@@ -923,14 +832,13 @@ class HSPocketDirectorPlugin(WAN2GPPlugin):
         trace(f"media - {file_name}")
         return {"ok": True, "mediaId": media_id}
 
-    # ------------------------------------------------------------------
-    # iframe host
-    # ------------------------------------------------------------------
     def _iframe_html(self) -> str:
         if not INDEX_FILE.exists():
             return "<div style='padding:20px;color:#fca5a5;background:#111827;'>HS Pocket Director could not find assets/index.html.</div>"
         src = self._served_asset_url(INDEX_FILE)
-        if not src:
+        if src:
+            src = f"{src}?v={ASSET_REVISION}"
+        else:
             encoded = base64.b64encode(INDEX_FILE.read_bytes()).decode("ascii")
             src = f"data:text/html;base64,{encoded}"
         return (
